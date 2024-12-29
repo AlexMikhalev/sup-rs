@@ -1,6 +1,7 @@
 use crate::config::{Command, Network, Upload};
 use anyhow::{Context, Result};
 use colored::*;
+use regex::Regex;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Command as ProcessCommand, Stdio};
@@ -31,14 +32,89 @@ impl SshHost {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Executor {
     network: Network,
     env: std::collections::HashMap<String, String>,
+    only: Option<Regex>,
+    except: Option<Regex>,
+    disable_prefix: bool,
 }
 
 impl Executor {
-    pub fn new(network: Network, env: std::collections::HashMap<String, String>) -> Self {
-        Self { network, env }
+    pub fn new(
+        network: Network,
+        env: std::collections::HashMap<String, String>,
+        only: Option<String>,
+        except: Option<String>,
+        disable_prefix: bool,
+    ) -> Result<Self> {
+        let only = only.map(|r| Regex::new(&r)).transpose()?;
+        let except = except.map(|r| Regex::new(&r)).transpose()?;
+        
+        Ok(Self {
+            network,
+            env,
+            only,
+            except,
+            disable_prefix,
+        })
+    }
+
+    fn filter_hosts(&self, hosts: &[String]) -> Vec<String> {
+        hosts.iter()
+            .filter(|host| {
+                // Apply --only filter
+                if let Some(only) = &self.only {
+                    if !only.is_match(host) {
+                        return false;
+                    }
+                }
+                
+                // Apply --except filter
+                if let Some(except) = &self.except {
+                    if except.is_match(host) {
+                        return false;
+                    }
+                }
+                
+                true
+            })
+            .cloned()
+            .collect()
+    }
+
+    async fn resolve_hosts(&self) -> Result<Vec<String>> {
+        let mut hosts = Vec::new();
+
+        // Add static hosts
+        hosts.extend(self.network.hosts.clone());
+
+        // Run inventory command if present
+        if let Some(inventory) = &self.network.inventory {
+            debug!("Running inventory command: {}", inventory);
+            let output = ProcessCommand::new("sh")
+                .arg("-c")
+                .arg(inventory)
+                .env_clear()
+                .envs(&self.env)
+                .output()?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!("Inventory command failed: {}", stderr);
+            }
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if !line.trim().is_empty() {
+                    hosts.push(line.trim().to_string());
+                }
+            }
+        }
+
+        // Apply host filters
+        Ok(self.filter_hosts(&hosts))
     }
 
     pub async fn execute_local(&self, cmd: &str) -> Result<()> {
@@ -57,23 +133,91 @@ impl Executor {
         Ok(())
     }
 
-    pub async fn execute_ssh(&self, cmd: &str, interactive: bool) -> Result<()> {
+    pub async fn execute_script(&self, script: &str) -> Result<()> {
+        let script_path = Path::new(script);
+        if !script_path.exists() {
+            anyhow::bail!("Script file does not exist: {}", script);
+        }
+
+        println!("{} {}", "SCRIPT".green(), script);
+        
+        let status = ProcessCommand::new("sh")
+            .arg(script)
+            .env_clear()
+            .envs(&self.env)
+            .status()?;
+
+        if !status.success() {
+            anyhow::bail!("Script failed with status: {}", status);
+        }
+        Ok(())
+    }
+
+    pub async fn execute_ssh(&self, cmd: &str, interactive: bool, serial: Option<usize>, once: bool) -> Result<()> {
+        let hosts = self.resolve_hosts().await?;
+        
+        if hosts.is_empty() {
+            warn!("No hosts matched the filters");
+            return Ok(());
+        }
+
         if interactive {
             // For interactive mode, we only support one host at a time
-            if self.network.hosts.len() > 1 {
+            if hosts.len() > 1 {
                 anyhow::bail!("Interactive mode only supports one host at a time");
             }
-            let host = SshHost::parse(&self.network.hosts[0])?;
+            let host = SshHost::parse(&hosts[0])?;
             self.handle_interactive_session(&host, cmd).await
+        } else if once {
+            // For once mode, only run on the first host
+            if let Some(host) = hosts.first() {
+                let host = SshHost::parse(host)?;
+                self.handle_ssh_session(&host, cmd, None).await?;
+            }
+            Ok(())
+        } else if let Some(batch_size) = serial {
+            // For serial mode, run on hosts in batches
+            for chunk in hosts.chunks(batch_size) {
+                let mut handles = Vec::new();
+                for host in chunk {
+                    let host = SshHost::parse(host)?;
+                    let cmd = cmd.to_string();
+                    let (tx, mut rx) = mpsc::channel(32);
+                    let executor = self.clone();
+                    
+                    let handle = tokio::spawn(async move {
+                        if let Err(e) = executor.handle_ssh_session(&host, &cmd, Some(tx)).await {
+                            eprintln!("Error on host {}: {}", host.to_string(), e);
+                        }
+                    });
+                    handles.push((handle, rx));
+                }
+
+                // Process output from all hosts in this batch
+                for (handle, mut rx) in handles {
+                    while let Some((host, output)) = rx.recv().await {
+                        if self.disable_prefix {
+                            print!("{}", output);
+                        } else {
+                            println!("{} {}", host.blue(), output);
+                        }
+                    }
+                    handle.await?;
+                }
+            }
+            Ok(())
         } else {
+            // For parallel mode, run on all hosts at once
             self.handle_parallel_sessions(cmd).await
         }
     }
 
     pub async fn execute_upload(&self, uploads: &[Upload]) -> Result<()> {
         debug!("Starting upload process for {} files", uploads.len());
-        for host_str in &self.network.hosts {
-            let host = SshHost::parse(host_str)?;
+        let hosts = self.resolve_hosts().await?;
+        
+        for host_str in hosts {
+            let host = SshHost::parse(&host_str)?;
             for upload in uploads {
                 self.handle_upload(&host, upload).await?;
             }
@@ -165,12 +309,13 @@ impl Executor {
     }
 
     async fn handle_parallel_sessions(&self, cmd: &str) -> Result<()> {
+        let hosts = self.resolve_hosts().await?;
         let (tx, mut rx) = mpsc::channel(32);
         let mut handles = Vec::new();
         
-        for host_str in &self.network.hosts {
+        for host_str in hosts {
             let tx = tx.clone();
-            let host = match SshHost::parse(host_str) {
+            let host = match SshHost::parse(&host_str) {
                 Ok(h) => h,
                 Err(e) => {
                     eprintln!("Error parsing host {}: {}", host_str, e);
@@ -180,9 +325,10 @@ impl Executor {
             info!("Connecting to {}", host.to_string());
             let cmd = cmd.to_string();
             let host_str = host_str.to_string();
+            let executor = self.clone();
             
             let handle = tokio::spawn(async move {
-                if let Err(e) = Self::handle_ssh_session(&host, &cmd, tx).await {
+                if let Err(e) = executor.handle_ssh_session(&host, &cmd, Some(tx)).await {
                     eprintln!("Error on host {}: {}", host_str, e);
                 }
             });
@@ -194,7 +340,11 @@ impl Executor {
         
         // Process output from all hosts
         while let Some((host, output)) = rx.recv().await {
-            println!("{} {}", host.blue(), output);
+            if self.disable_prefix {
+                print!("{}", output);
+            } else {
+                println!("{} {}", host.blue(), output);
+            }
         }
 
         // Wait for all tasks to complete
@@ -228,9 +378,10 @@ impl Executor {
     }
 
     async fn handle_ssh_session(
+        &self,
         host: &SshHost,
         cmd: &str,
-        tx: mpsc::Sender<(String, String)>,
+        tx: Option<mpsc::Sender<(String, String)>>,
     ) -> Result<()> {
         debug!("Starting SSH session to {}", host.to_string());
 
@@ -259,17 +410,32 @@ impl Executor {
         let stdout_reader = BufReader::new(stdout);
         let stderr_reader = BufReader::new(stderr);
 
-        // Process stdout
-        for line in stdout_reader.lines() {
-            if let Ok(line) = line {
-                tx.send((host.to_string(), format!("{}\n", line))).await?;
+        if let Some(tx) = tx {
+            // Process stdout
+            for line in stdout_reader.lines() {
+                if let Ok(line) = line {
+                    tx.send((host.to_string(), format!("{}\n", line))).await?;
+                }
             }
-        }
 
-        // Process stderr
-        for line in stderr_reader.lines() {
-            if let Ok(line) = line {
-                tx.send((host.to_string(), format!("stderr: {}\n", line))).await?;
+            // Process stderr
+            for line in stderr_reader.lines() {
+                if let Ok(line) = line {
+                    tx.send((host.to_string(), format!("stderr: {}\n", line))).await?;
+                }
+            }
+        } else {
+            // Direct output mode
+            for line in stdout_reader.lines() {
+                if let Ok(line) = line {
+                    println!("{}", line);
+                }
+            }
+
+            for line in stderr_reader.lines() {
+                if let Ok(line) = line {
+                    eprintln!("stderr: {}", line);
+                }
             }
         }
 
@@ -286,8 +452,17 @@ impl Executor {
             self.execute_local(local_cmd).await?;
         }
 
+        if let Some(script) = &command.script {
+            self.execute_script(script).await?;
+        }
+
         if let Some(remote_cmd) = &command.run {
-            self.execute_ssh(remote_cmd, command.stdin).await?;
+            self.execute_ssh(
+                remote_cmd,
+                command.stdin,
+                command.serial,
+                command.once
+            ).await?;
         }
 
         if let Some(uploads) = &command.upload {

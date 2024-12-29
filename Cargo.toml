@@ -2,8 +2,8 @@
 name = "sup-rs"
 version = "0.1.0"
 edition = "2021"
-authors = ["Sup-rs Team"]
-description = "A Rust implementation of Stack Up - parallel deployment tool"
+authors = ["Your Name <your.email@example.com>"]
+description = "Stack Up - A simple deployment tool in Rust"
 
 [dependencies]
 tokio = { version = "1.32", features = ["full"] }
@@ -21,3 +21,4 @@ colored = "2.0"
 whoami = "1.4"
 chrono = "0.4"
 dirs = "5.0"
+regex = "1.9"
