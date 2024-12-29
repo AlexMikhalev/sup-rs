@@ -1,11 +1,12 @@
-use crate::config::{Command, Network};
+use crate::config::{Command, Network, Upload};
 use anyhow::{Context, Result};
 use colored::*;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::Path;
 use std::process::{Command as ProcessCommand, Stdio};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone)]
 struct SshHost {
@@ -67,6 +68,100 @@ impl Executor {
         } else {
             self.handle_parallel_sessions(cmd).await
         }
+    }
+
+    pub async fn execute_upload(&self, uploads: &[Upload]) -> Result<()> {
+        debug!("Starting upload process for {} files", uploads.len());
+        for host_str in &self.network.hosts {
+            let host = SshHost::parse(host_str)?;
+            for upload in uploads {
+                self.handle_upload(&host, upload).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn ensure_remote_dir(&self, host: &SshHost, dir: &str) -> Result<()> {
+        debug!("Ensuring remote directory exists: {}", dir);
+        let mut ssh_cmd = ProcessCommand::new("ssh");
+        ssh_cmd
+            .arg(&host.to_string())
+            .arg(format!("mkdir -p '{}'", dir))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let output = ssh_cmd.output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("Failed to create remote directory: {}", stderr);
+        }
+        Ok(())
+    }
+
+    async fn handle_upload(&self, host: &SshHost, upload: &Upload) -> Result<()> {
+        let src_path = Path::new(&upload.src);
+        if !src_path.exists() {
+            anyhow::bail!("Source path does not exist: {}", upload.src);
+        }
+
+        info!("Uploading {} to {}:{}", upload.src, host.to_string(), upload.dst);
+
+        // Ensure remote directory exists
+        self.ensure_remote_dir(host, &upload.dst).await?;
+
+        // Get source file/directory info
+        let src_metadata = src_path.metadata()?;
+        debug!("Source metadata: {:?}", src_metadata);
+
+        // Create tar process to read from source
+        let mut tar_cmd = ProcessCommand::new("tar");
+        tar_cmd
+            .arg("-czf")
+            .arg("-")
+            .arg("-C")
+            .arg(src_path.parent().unwrap_or_else(|| Path::new(".")))
+            .arg(src_path.file_name().unwrap())
+            .stdout(Stdio::piped());
+
+        debug!("Running tar command: {:?}", tar_cmd);
+        let mut tar_process = tar_cmd.spawn()?;
+        let tar_output = tar_process.stdout.take()
+            .context("Failed to get tar stdout")?;
+
+        // Create SSH process to write to destination
+        let mut ssh_cmd = ProcessCommand::new("ssh");
+        ssh_cmd
+            .arg(&host.to_string())
+            .arg(format!("cd '{}' && tar xzf -", upload.dst))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        debug!("Running SSH command: {:?}", ssh_cmd);
+        let mut ssh_process = ssh_cmd.spawn()?;
+        let mut ssh_input = ssh_process.stdin.take()
+            .context("Failed to get SSH stdin")?;
+
+        // Copy tar output to SSH input
+        debug!("Starting file transfer");
+        let bytes_copied = std::io::copy(&mut BufReader::new(tar_output), &mut ssh_input)?;
+        debug!("Transferred {} bytes", bytes_copied);
+        drop(ssh_input); // Close stdin to signal EOF
+
+        // Wait for both processes and capture output
+        let tar_status = tar_process.wait()?;
+        if !tar_status.success() {
+            anyhow::bail!("Tar command failed with status: {}", tar_status);
+        }
+
+        let ssh_output = ssh_process.wait_with_output()?;
+        if !ssh_output.status.success() {
+            let stderr = String::from_utf8_lossy(&ssh_output.stderr);
+            anyhow::bail!("SSH command failed: {}", stderr);
+        }
+
+        info!("Successfully uploaded {} to {}:{}", upload.src, host.to_string(), upload.dst);
+        Ok(())
     }
 
     async fn handle_parallel_sessions(&self, cmd: &str) -> Result<()> {
@@ -195,6 +290,10 @@ impl Executor {
             self.execute_ssh(remote_cmd, command.stdin).await?;
         }
 
+        if let Some(uploads) = &command.upload {
+            self.execute_upload(uploads).await?;
+        }
+
         Ok(())
     }
-} 
+}
