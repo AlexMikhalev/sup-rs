@@ -1,0 +1,17 @@
+###########################################################################
+# libssh2 installation details
+###########################################################################
+
+prefix=/Users/alex/go/src/sup/sup-rs/target/debug/build/libssh2-sys-da67c09589b6f5ff/out
+exec_prefix=
+libdir=/Users/alex/go/src/sup/sup-rs/target/debug/build/libssh2-sys-da67c09589b6f5ff/out/lib
+includedir=/Users/alex/go/src/sup/sup-rs/target/debug/build/libssh2-sys-da67c09589b6f5ff/out/include
+
+Name: libssh2
+URL: https://www.libssh2.org/
+Description: Library for SSH-based communication
+Version: 1.10.1_DEV
+Requires.private: 
+Libs: -L${libdir} -lssh2 
+Libs.private: 
+Cflags: -I${includedir}
