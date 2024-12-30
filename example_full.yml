@@ -1,0 +1,182 @@
+---
+version: 0.4
+
+# Global environment variables
+env:
+  NAME: example-app
+  IMAGE: example/api:latest
+  HOST_PORT: 8000
+  CONTAINER_PORT: 8000
+  CONFIG_PATH: /etc/example-app
+
+networks:
+  # Local development
+  local:
+    hosts:
+      - localhost
+    env:
+      DOCKER_HOST: unix:///var/run/docker.sock
+
+  # Development environment
+  dev:
+    hosts:
+      - dev@dev1.example.com
+      - dev@dev2.example.com
+    env:
+      ENV: development
+      DEBUG: true
+
+  # Staging environment with dynamic inventory
+  staging:
+    inventory: aws ec2 describe-instances --filters "Name=tag:Environment,Values=staging" --query 'Reservations[].Instances[].PrivateIpAddress' --output text | tr '\t' '\n'
+    env:
+      ENV: staging
+
+  # Production environment with multiple regions
+  prod-us:
+    hosts:
+      - app@us1.example.com
+      - app@us2.example.com
+      - app@us3.example.com
+    env:
+      ENV: production
+      REGION: us-east-1
+
+  prod-eu:
+    hosts:
+      - app@eu1.example.com
+      - app@eu2.example.com
+    env:
+      ENV: production
+      REGION: eu-west-1
+
+commands:
+  # Basic commands
+  ping:
+    desc: Print system info and current time
+    run: uname -a; date
+
+  bash:
+    desc: Interactive Bash on all hosts
+    stdin: true
+    run: bash
+
+  # Build and deployment commands
+  build:
+    desc: Build Docker image
+    local: docker build -t $IMAGE .
+    once: true
+
+  test:
+    desc: Run tests
+    local: |
+      go test -v ./...
+      go vet ./...
+
+  push:
+    desc: Push Docker image to registry
+    local: docker push $IMAGE
+    once: true
+
+  # Configuration management
+  upload-config:
+    desc: Upload and verify configuration files
+    upload:
+      - src: ./config/$ENV.yml
+        dst: $CONFIG_PATH/
+    run: test -f $CONFIG_PATH/$ENV.yml
+
+  # Database commands
+  migrate:
+    desc: Run database migrations
+    run: |
+      cd /app/migrations
+      ./migrate.sh up
+    once: true
+
+  backup-db:
+    desc: Backup database
+    run: |
+      timestamp=$(date +%Y%m%d_%H%M%S)
+      pg_dump -U $DB_USER $DB_NAME > /backups/db_${timestamp}.sql
+    once: true
+
+  # Application deployment
+  stop:
+    desc: Stop application containers
+    run: docker stop $NAME || true
+
+  remove:
+    desc: Remove application containers
+    run: docker rm $NAME || true
+
+  start:
+    desc: Start application containers
+    run: |
+      docker run -d \
+        --name $NAME \
+        -p $HOST_PORT:$CONTAINER_PORT \
+        -v $CONFIG_PATH:/etc/app \
+        --restart=always \
+        $IMAGE
+
+  rolling-update:
+    desc: Perform rolling update of application
+    run: |
+      docker pull $IMAGE
+      docker stop $NAME || true
+      docker rm $NAME || true
+      docker run -d \
+        --name $NAME \
+        -p $HOST_PORT:$CONTAINER_PORT \
+        -v $CONFIG_PATH:/etc/app \
+        --restart=always \
+        $IMAGE
+    serial: 2
+
+  # Monitoring and debugging
+  logs:
+    desc: Show application logs
+    run: docker logs --tail=100 -f $NAME
+
+  status:
+    desc: Check application status
+    run: |
+      echo "Container Status:"
+      docker ps --filter name=$NAME
+      echo "Application Health:"
+      curl -s http://localhost:$HOST_PORT/health
+
+  debug:
+    desc: Interactive debug session
+    stdin: true
+    run: docker exec -it $NAME bash
+
+  # Cleanup tasks
+  cleanup:
+    desc: Clean old artifacts and logs
+    run: |
+      find /var/log/app -type f -mtime +30 -delete
+      docker system prune -f
+    serial: 1
+
+targets:
+  # Deployment targets
+  deploy:
+    - build
+    - test
+    - push
+    - upload-config
+    - rolling-update
+    - status
+
+  # Maintenance targets
+  maintenance:
+    - backup-db
+    - cleanup
+
+  # Quick deployment without tests
+  quick-deploy:
+    - build
+    - push
+    - rolling-update 
