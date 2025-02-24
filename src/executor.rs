@@ -8,6 +8,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
+use shell_quote;
 
 #[derive(Debug, Clone)]
 struct SshHost {
@@ -281,7 +282,7 @@ impl Executor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        debug!("Running SSH command: {:?}", ssh_cmd);
+        debug!("Running SSH command: {:#?}", ssh_cmd);
         let mut ssh_process = ssh_cmd.spawn()?;
         let mut ssh_input = ssh_process.stdin.take()
             .context("Failed to get SSH stdin")?;
@@ -367,7 +368,7 @@ impl Executor {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
 
-        debug!("Running command: {:?}", ssh_cmd);
+        debug!("Running command: {:#?}", ssh_cmd);
         let status = ssh_cmd.status()?;
 
         if !status.success() {
@@ -375,6 +376,18 @@ impl Executor {
         }
 
         Ok(())
+    }
+
+    fn prepare_remote_command(&self, cmd: &str) -> String {
+        // If command starts with sudo, ensure we preserve environment and handle quoting
+        if cmd.trim().starts_with("sudo") {
+            // Preserve environment variables with -E flag
+            // Use bash -c to properly handle complex commands
+            let quoted = shell_quote::bash::quote(cmd.trim_start_matches("sudo").trim());
+            format!("sudo -E bash -c '{}'", quoted.to_string_lossy())
+        } else {
+            cmd.to_string()
+        }
     }
 
     async fn handle_ssh_session(
@@ -388,17 +401,20 @@ impl Executor {
         let mut ssh_cmd = ProcessCommand::new("ssh");
         ssh_cmd.arg(&host.to_string());
 
+        // Prepare the command with proper sudo handling
+        let prepared_cmd = self.prepare_remote_command(cmd);
+
         // For non-interactive mode, use sh -c to properly handle command with arguments
         ssh_cmd
             .arg("sh")
             .arg("-c")
-            .arg(cmd);
+            .arg(&prepared_cmd);
 
         ssh_cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        debug!("Running command: {:?}", ssh_cmd);
+        debug!("Running command: {:#?}", ssh_cmd);
         let mut child = ssh_cmd.spawn()?;
         
         let stdout = child.stdout.take()
@@ -470,5 +486,71 @@ impl Executor {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn create_test_executor() -> Executor {
+        let network = Network {
+            hosts: vec!["test@localhost".to_string()],
+            inventory: None,
+            env: None,
+        };
+        let env = HashMap::new();
+        Executor::new(network, env, None, None, false).unwrap()
+    }
+
+    #[test]
+    fn test_prepare_remote_command() {
+        let executor = create_test_executor();
+
+        // Test regular command
+        let cmd = "echo 'hello world'";
+        assert_eq!(executor.prepare_remote_command(cmd), cmd.to_string());
+
+        // Test sudo command
+        let sudo_cmd = "sudo apt-get install -y package";
+        let prepared = executor.prepare_remote_command(sudo_cmd);
+        assert!(prepared.starts_with("sudo -E bash -c "));
+        assert!(prepared.contains("apt-get"));
+        assert!(prepared.contains("install"));
+        assert!(prepared.contains("package"));
+
+        // Test sudo command with complex arguments
+        let complex_sudo = r#"sudo sh -c 'echo "complex argument" > /etc/file'"#;
+        let prepared = executor.prepare_remote_command(complex_sudo);
+        assert!(prepared.starts_with("sudo -E bash -c "));
+        assert!(prepared.contains("complex argument"));
+        assert!(prepared.contains("/etc/file"));
+
+        // Test sudo command with environment variables
+        let env_sudo = r#"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y package"#;
+        let prepared = executor.prepare_remote_command(env_sudo);
+        assert!(prepared.starts_with("sudo -E bash -c "));
+        assert!(prepared.contains("DEBIAN_FRONTEND=noninteractive"));
+        assert!(prepared.contains("apt-get"));
+    }
+
+    #[test]
+    fn test_sudo_command_whitespace() {
+        let executor = create_test_executor();
+
+        // Test sudo command with leading whitespace
+        let cmd_with_space = "   sudo apt-get install -y package";
+        let prepared = executor.prepare_remote_command(cmd_with_space);
+        assert!(prepared.starts_with("sudo -E bash -c "));
+        assert!(prepared.contains("apt-get"));
+
+        // Test sudo command with multiple spaces
+        let cmd_multi_space = "sudo   apt-get    install   -y    package";
+        let prepared = executor.prepare_remote_command(cmd_multi_space);
+        assert!(prepared.starts_with("sudo -E bash -c "));
+        assert!(prepared.contains("apt-get"));
+        assert!(prepared.contains("install"));
+        assert!(prepared.contains("package"));
     }
 }
